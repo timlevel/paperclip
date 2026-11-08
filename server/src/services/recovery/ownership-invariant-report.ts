@@ -1,9 +1,7 @@
 import { and, asc, eq, inArray, isNotNull, isNull, lt, notExists, or, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
-  budgetPolicies,
   heartbeatRuns,
-  nativeRunFinalizations,
   issueRecoveryActions,
   issues,
   type Db,
@@ -111,8 +109,6 @@ export function createOwnershipReportState(): OwnershipReportState {
 
 const TERMINAL_RUN_STATUSES = ["succeeded", "failed", "cancelled", "timed_out", "interrupted"];
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"];
-/** Accounting closure deadline used by the admission gate (run-cost-accounting.ts). */
-const ACCOUNTING_CLOSURE_MS = 10 * 60_000;
 /** An in-progress issue must show a next action within this time. */
 const NEXT_ACTION_GRACE_MS = 5 * 60_000;
 /** Records read per kind (and per I3/I7 check) per pass; beyond this the
@@ -159,44 +155,37 @@ async function classify(owner: RecordOwner, runProofs: Map<string, Classificatio
 
 const violationKey = (violation: InvariantViolation) => `${violation.rule}:${violation.kind}:${violation.recordId}`;
 
-/** Admission still waits on accounting (inventory finding 3). This mirrors
- * the `waitingRunCount` gate of budget-exposure.ts, including late-receipt
- * debt: a terminal run with
- * pending accounting holds its company's new work unless it is a succeeded
- * run with observed cost, or a native run whose coordinator is still
- * recovering. Only companies with an active budget policy have the gate, and
- * only runs past the accounting closure deadline are reported. */
+/** Refusal texts that name unfinished accounting or cleanup as the reason
+ * work could not start, as a PostgreSQL case-insensitive regular expression.
+ * Phase 3 removed every such gate, so any match is a regression. */
+const ACCOUNTING_HOLD_PATTERN = "await(s|ing)? accounting|unfinished accounting|awaiting reconciliation";
+
+/** Invariant 3: admission never waits on another run's cleanup or
+ * accounting. Phase 3 removed the five gates that did (inventory finding 3),
+ * so this reads the outcome instead of mirroring a gate: a wake request or a
+ * run refused within the lookback window with an accounting-hold reason. */
 async function checkAdmissionIndependence(db: Db, now: Date, limit: number): Promise<InvariantViolation[]> {
-  const usage = heartbeatRuns.usageJson;
-  const lateReceiptDebt = sql`coalesce(${usage}->>'accountingLateReceiptPending', 'false') = 'true'`;
-  const boundedSucceeded = sql`(${heartbeatRuns.status} = 'succeeded' and ${usage}->'budgetExposure'->>'costCents' is not null)`;
-  const closingReceipt = sql`${usage}->>'accountingReceiptReady' = 'false' and ${usage}->>'accountingCaptureFailed' is distinct from 'true'`;
-  const recovering = sql`(${heartbeatRuns.runtimeMode} = 'native' and not (${lateReceiptDebt}) and exists (select 1 from ${nativeRunFinalizations}
-    where ${nativeRunFinalizations.runId} = ${heartbeatRuns.id} and ${nativeRunFinalizations.companyId} = ${heartbeatRuns.companyId}
-      and ${nativeRunFinalizations.resultId} is null
-      and (${nativeRunFinalizations.phase} <> 'terminal_failure' or (${closingReceipt}))))`;
-  const gated = sql`exists (select 1 from ${budgetPolicies} where ${budgetPolicies.companyId} = ${heartbeatRuns.companyId}
-    and ${budgetPolicies.isActive} = true
-    and (${budgetPolicies.scopeType} = 'company'
-      or (${budgetPolicies.scopeType} = 'agent' and ${budgetPolicies.scopeId} = ${heartbeatRuns.agentId})
-      or (${budgetPolicies.scopeType} = 'project' and ${usage}->'ledgerScope'->>'projectId' = ${budgetPolicies.scopeId}::text))
-    and (${budgetPolicies.windowKind} <> 'calendar_month_utc' or (${lateReceiptDebt})
-      or ${heartbeatRuns.finishedAt} >= (date_trunc('month', ${now.toISOString()}::timestamptz at time zone 'UTC') at time zone 'UTC')))`;
-  const violations: InvariantViolation[] = [];
-  for (let offset = 0; offset < MAX_RECORDS_PER_KIND; offset += limit) {
-    const rows = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, issueId: heartbeatRuns.issueId })
-      .from(heartbeatRuns).where(and(or(eq(heartbeatRuns.costAccountingPending, true), lateReceiptDebt),
-        inArray(heartbeatRuns.status, TERMINAL_RUN_STATUSES),
-        lt(heartbeatRuns.finishedAt, new Date(now.getTime() - ACCOUNTING_CLOSURE_MS)),
-        sql`not ${boundedSucceeded}`, sql`not ${recovering}`, gated))
-      .orderBy(asc(heartbeatRuns.id)).limit(limit).offset(offset);
-    for (const row of rows) {
-      violations.push({ rule: "I3_admission_independent", kind: "run_accounting_debt", recordId: row.id,
-        companyId: row.companyId, runId: row.id, issueId: row.issueId, reason: "accounting_debt_holds_admission" });
-    }
-    if (rows.length < limit) break;
-  }
-  return violations;
+  const since = new Date(now.getTime() - INTENT_LOOKBACK_MS);
+  const wakeText = sql`(coalesce(${agentWakeupRequests.error}, '') || ' '
+    || coalesce(${agentWakeupRequests.payload}->'executionWait'->>'message', ''))`;
+  const runText = sql`(coalesce(${heartbeatRuns.error}, '') || ' ' || coalesce(${heartbeatRuns.resultJson}->>'admissionBlockReason', ''))`;
+  const cap = Math.min(limit, MAX_RECORDS_PER_KIND);
+  const [wakes, runs] = await Promise.all([
+    db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId, runId: agentWakeupRequests.runId,
+      issueId: sql<string | null>`${agentWakeupRequests.payload}->>'issueId'` })
+      .from(agentWakeupRequests).where(and(sql`${agentWakeupRequests.updatedAt} >= ${since.toISOString()}::timestamptz`,
+        sql`${wakeText} ~* ${ACCOUNTING_HOLD_PATTERN}`)).orderBy(asc(agentWakeupRequests.id)).limit(cap),
+    db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, issueId: heartbeatRuns.issueId })
+      .from(heartbeatRuns).where(and(sql`${heartbeatRuns.updatedAt} >= ${since.toISOString()}::timestamptz`,
+        inArray(heartbeatRuns.status, ["cancelled", "failed"]), sql`${runText} ~* ${ACCOUNTING_HOLD_PATTERN}`))
+      .orderBy(asc(heartbeatRuns.id)).limit(cap),
+  ]);
+  return [
+    ...wakes.map(row => ({ rule: "I3_admission_independent" as const, kind: "wake_request", recordId: row.id,
+      companyId: row.companyId, runId: row.runId, issueId: row.issueId, reason: "refused_for_accounting_hold" })),
+    ...runs.map(row => ({ rule: "I3_admission_independent" as const, kind: "queued_run", recordId: row.id,
+      companyId: row.companyId, runId: row.id, issueId: row.issueId, reason: "refused_for_accounting_hold" })),
+  ];
 }
 
 /** A wake request that ended terminally on a refusal that names a temporary
